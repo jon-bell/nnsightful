@@ -33,6 +33,22 @@ class LogitLensData(ToolData):
         return display_logit_lens(self, **kwargs)
 
 
+class MultiStepLogitLensData(ToolData):
+    meta: LogitLensMeta
+    steps: list[LogitLensData]
+    generated_token_ids: list[int]
+    generated_tokens: list[str]
+
+    def display(self, **kwargs):
+        from nnsightful.viz import display_logit_lens
+
+        # Default behavior: display the final step. Callers can index `steps`
+        # themselves for other views.
+        if not self.steps:
+            return None
+        return display_logit_lens(self.steps[-1], **kwargs)
+
+
 class ActivationPatchingData(ToolData):
     lines: list[list[float]]  # [token][layer] probabilities
     ranks: list[list[int]]  # [token][layer] ranks

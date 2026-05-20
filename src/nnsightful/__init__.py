@@ -4,10 +4,12 @@ from nnsightful.tools._base import Tool
 from nnsightful.tools._utils import IndexSpec, resolve_indices
 from nnsightful.tools.activation_patching import activation_patching
 from nnsightful.tools.logit_lens import logit_lens
+from nnsightful.tools.multi_step_logit_lens import multi_step_logit_lens
 from nnsightful.types import (
     ActivationPatchingData,
     LogitLensData,
     LogitLensMeta,
+    MultiStepLogitLensData,
     ToolData,
 )
 from nnsightful.viz import display_activation_patching, display_line_plot, display_logit_lens
@@ -15,6 +17,7 @@ from nnsightful.viz import display_activation_patching, display_line_plot, displ
 __all__ = [
     "activation_patching",
     "logit_lens",
+    "multi_step_logit_lens",
     "Tool",
     "ToolData",
     "IndexSpec",
@@ -22,6 +25,7 @@ __all__ = [
     "ActivationPatchingData",
     "LogitLensData",
     "LogitLensMeta",
+    "MultiStepLogitLensData",
     "display_activation_patching",
     "display_line_plot",
     "display_logit_lens",
