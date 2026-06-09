@@ -1,4 +1,6 @@
 from abc import abstractmethod
+from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -50,4 +52,79 @@ class ActivationPatchingData(ToolData):
         options["selectedTokens"] = selected
         return display_activation_patching(
             data, options=options, return_html=return_html, **kwargs
+        )
+
+
+class ArchKind(str, Enum):
+    GPT2 = "gpt2"
+    LLAMA = "llama"
+
+
+class ForwardPassArch(BaseModel):
+    kind: ArchKind
+    n_layers: int
+    n_heads: int
+    n_kv_heads: int
+    d_model: int
+    d_head: int
+    vocab_size: int
+    positional_kind: Literal["absolute", "rope"]
+    has_fused_qkv: bool
+    tie_word_embeddings: bool
+
+
+class ForwardPassMeta(BaseModel):
+    version: int = 1
+    model: str
+    arch: ForwardPassArch
+
+
+class TopKLogits(BaseModel):
+    token_ids: list[int]
+    tokens: list[str]
+    logits: list[float]
+    probs: list[float]
+
+
+class AttentionPayload(BaseModel):
+    scores: list[list[list[float]]]
+    scores_masked: list[list[list[float]]]
+    probs: list[list[list[float]]]
+
+
+class LayerPositionPayload(BaseModel):
+    resid_pre: list[list[float]]
+    ln1_out: list[list[float]]
+    q: list[list[list[float]]]
+    k: list[list[list[float]]]
+    v: list[list[list[float]]]
+    attn_out: list[list[float]]
+    resid_mid: list[list[float]]
+    ln2_out: list[list[float]]
+    mlp_out: list[list[float]]
+    resid_post: list[list[float]]
+
+
+class LayerPayload(BaseModel):
+    attention: AttentionPayload
+    per_position: LayerPositionPayload
+
+
+class ForwardPassData(ToolData):
+    meta: ForwardPassMeta
+    input_token_ids: list[int]
+    input_tokens: list[str]
+    positions: list[int]
+    tok_embed: list[list[float]] | None = None
+    pos_embed: list[list[float]] | None = None
+    input_embed: list[list[float]] | None = None
+    layers: list[LayerPayload]
+    ln_final_out: list[list[float]]
+    topk_per_position: list[TopKLogits]
+    next_token: TopKLogits
+
+    def display(self, **kwargs):
+        raise NotImplementedError(
+            "ForwardPassData has no Python-side visualization; render via the "
+            "transformer-explainer Svelte app at http://localhost:5173/transformer-explainer/"
         )
