@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 
 _SUPPORTED_LLAMA_TYPES = {"llama", "mistral", "qwen2"}
+# Per-arch rotary_dim default (in dims of the head). None means full head_dim.
+_GPTJ_DEFAULT_ROPE_THETA = 10000.0
 
 
 def _detect_arch(model: "StandardizedTransformer") -> dict[str, Any]:
@@ -34,13 +36,17 @@ def _detect_arch(model: "StandardizedTransformer") -> dict[str, Any]:
         kind = "gpt2"
         has_fused_qkv = True
         positional_kind: Literal["absolute", "rope"] = "absolute"
+    elif model_type == "gptj":
+        kind = "gptj"
+        has_fused_qkv = False
+        positional_kind = "rope"
     elif model_type in _SUPPORTED_LLAMA_TYPES:
         kind = "llama"
         has_fused_qkv = False
         positional_kind = "rope"
     else:
         raise NotImplementedError(
-            f"forward_pass: unsupported model_type {model_type!r}; supported: gpt2, llama, mistral, qwen2"
+            f"forward_pass: unsupported model_type {model_type!r}; supported: gpt2, gptj, llama, mistral, qwen2"
         )
 
     n_heads = int(getattr(cfg, "num_attention_heads", 0) or getattr(cfg, "n_head", 0))
@@ -122,8 +128,13 @@ class ForwardPassTool(Tool):
         D: int = arch_dict["d_model"]
         Dh: int = arch_dict["d_head"]
         is_gpt2: bool = arch_dict["kind"] == "gpt2"
+        is_gptj: bool = arch_dict["kind"] == "gptj"
+        is_llama: bool = arch_dict["kind"] == "llama"
         is_rope: bool = arch_dict["positional_kind"] == "rope"
         is_absolute: bool = arch_dict["positional_kind"] == "absolute"
+        # GPT-J: partial RoPE — only the first `rotary_dim` of each head is rotated.
+        # Llama and friends rotate the full head_dim.
+        rotary_dim: int = int(getattr(cfg, "rotary_dim", 0)) if is_gptj else Dh
 
         token_ids = model.tokenizer.encode(prompt)
         S = len(token_ids)
@@ -225,18 +236,31 @@ class ForwardPassTool(Tool):
 
                 # Precompute cos/sin for RoPE inside trace
                 if is_rope:
+                    # GPT-J rotates only the first `rotary_dim` of each head.
+                    # Llama rotates the entire head_dim.
+                    rope_dim_eff = rotary_dim if is_gptj else Dh
                     inv_freq = 1.0 / (
                         rope_theta
                         ** (
-                            torch.arange(0, Dh, 2, dtype=torch.float, device=tok_e_full.device)
-                            / Dh
+                            torch.arange(
+                                0, rope_dim_eff, 2, dtype=torch.float, device=tok_e_full.device
+                            )
+                            / rope_dim_eff
                         )
                     )
                     pos_ids = torch.arange(S, dtype=torch.float, device=tok_e_full.device)
-                    freqs = torch.outer(pos_ids, inv_freq)  # [S, Dh/2]
-                    emb = torch.cat([freqs, freqs], dim=-1)  # [S, Dh]
-                    cos = emb.cos().to(tok_e_full.dtype)
-                    sin = emb.sin().to(tok_e_full.dtype)
+                    freqs = torch.outer(pos_ids, inv_freq)  # [S, rope_dim_eff/2]
+                    if is_gptj:
+                        # GPT-J: emb = repeat-interleave by 2 so adjacent dims
+                        # share each frequency. Matches rotate_every_two() below.
+                        cos = freqs.cos().repeat_interleave(2, dim=-1).to(tok_e_full.dtype)
+                        sin = freqs.sin().repeat_interleave(2, dim=-1).to(tok_e_full.dtype)
+                    else:
+                        # Llama: emb = cat([freqs, freqs]) so first half and second
+                        # half each carry the same frequency block. Matches rotate_half().
+                        emb = torch.cat([freqs, freqs], dim=-1)  # [S, head_dim]
+                        cos = emb.cos().to(tok_e_full.dtype)
+                        sin = emb.sin().to(tok_e_full.dtype)
 
                 layers_traced: list[dict[str, Any]] = []
                 for i in range(L):
@@ -250,7 +274,20 @@ class ForwardPassTool(Tool):
                         v = qkv[:, 2 * D :].view(S, H, Dh)
                         attn_out = model.layers[i].self_attn.c_proj.output[0]
                         ln2_out = model.layers[i].ln_2.output[0]
+                    elif is_gptj:
+                        # GPT-J: single ln_1, parallel residual, out_proj (not o_proj),
+                        # split q/k/v with no GQA. No ln_2 — reuse ln_1 for the
+                        # ln2_out slot so the payload shape matches GPT-2/Llama.
+                        ln1_out = model.layers[i].ln_1.output[0]
+                        sa = model.layers[i].self_attn
+                        q = sa.q_proj.output[0].view(S, H, Dh)
+                        k = sa.k_proj.output[0].view(S, H, Dh)
+                        v = sa.v_proj.output[0].view(S, H, Dh)
+                        attn_out = sa.out_proj.output[0]
+                        ln2_out = ln1_out
                     else:
+                        # Llama / Mistral / Qwen2: input_layernorm, q/k/v, o_proj,
+                        # post_attention_layernorm. GQA possible (Hk < H).
                         ln1_out = model.layers[i].input_layernorm.output[0]
                         sa = model.layers[i].self_attn
                         q = sa.q_proj.output[0].view(S, H, Dh)
@@ -260,17 +297,40 @@ class ForwardPassTool(Tool):
                         ln2_out = model.layers[i].post_attention_layernorm.output[0]
 
                     if is_rope:
-                        cos_b = cos.unsqueeze(1)  # [S, 1, Dh]
-                        sin_b = sin.unsqueeze(1)
+                        # NDIF hosts these models with device_map="auto", so each
+                        # layer can live on a different GPU. cos/sin were built
+                        # once from tok_e_full.device (cuda:0); the layer's q/k
+                        # may live on cuda:1+. Move on demand so the multiply
+                        # actually works.
+                        cos_b = cos.to(q.device).unsqueeze(1)  # [S, 1, rope_dim_eff]
+                        sin_b = sin.to(q.device).unsqueeze(1)
 
-                        def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-                            half = x.shape[-1] // 2
-                            x1 = x[..., :half]
-                            x2 = x[..., half:]
-                            return torch.cat([-x2, x1], dim=-1)
+                        if is_gptj:
+                            # Partial RoPE with rotate_every_two: rotate the first
+                            # `rotary_dim` of each head, pass the rest through unchanged.
+                            def _rotate_every_two(x: torch.Tensor) -> torch.Tensor:
+                                x1 = x[..., 0::2]
+                                x2 = x[..., 1::2]
+                                return torch.stack([-x2, x1], dim=-1).flatten(-2)
 
-                        q_rot = (q * cos_b) + (_rotate_half(q) * sin_b)
-                        k_rot = (k * cos_b) + (_rotate_half(k) * sin_b)
+                            q_head = q[..., :rotary_dim]
+                            q_pass = q[..., rotary_dim:]
+                            k_head = k[..., :rotary_dim]
+                            k_pass = k[..., rotary_dim:]
+                            q_head = (q_head * cos_b) + (_rotate_every_two(q_head) * sin_b)
+                            k_head = (k_head * cos_b) + (_rotate_every_two(k_head) * sin_b)
+                            q_rot = torch.cat([q_head, q_pass], dim=-1)
+                            k_rot = torch.cat([k_head, k_pass], dim=-1)
+                        else:
+                            # Llama-style full RoPE with rotate_half.
+                            def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+                                half = x.shape[-1] // 2
+                                x1 = x[..., :half]
+                                x2 = x[..., half:]
+                                return torch.cat([-x2, x1], dim=-1)
+
+                            q_rot = (q * cos_b) + (_rotate_half(q) * sin_b)
+                            k_rot = (k * cos_b) + (_rotate_half(k) * sin_b)
                     else:
                         q_rot, k_rot = q, k
 

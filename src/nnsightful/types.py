@@ -58,6 +58,7 @@ class ActivationPatchingData(ToolData):
 class ArchKind(str, Enum):
     GPT2 = "gpt2"
     LLAMA = "llama"
+    GPTJ = "gptj"
 
 
 class ForwardPassArch(BaseModel):

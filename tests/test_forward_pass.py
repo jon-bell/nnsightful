@@ -141,3 +141,62 @@ class TestForwardPassEndToEnd:
         assert rehydrated.meta.arch.n_layers == data.meta.arch.n_layers
         assert len(rehydrated.layers) == len(data.layers)
         assert rehydrated.next_token.token_ids == data.next_token.token_ids
+
+
+# Tiny CPU-friendly random-weight models that exercise the RoPE / partial-RoPE
+# code paths locally without needing GPU or NDIF. These cover the two trace
+# paths most likely to break under refactor.
+_TINY_LLAMA = "llamafactory/tiny-random-Llama-3"
+_TINY_GPTJ = "hf-internal-testing/tiny-random-GPTJForCausalLM"
+
+
+def _load_tiny(name: str):
+    from nnterp import StandardizedTransformer
+
+    try:
+        return StandardizedTransformer(name)
+    except Exception as exc:
+        pytest.skip(f"Cannot load {name}: {exc}")
+
+
+class TestForwardPassRoPE:
+    """Exercise the RoPE path on tiny random-weight models.
+
+    Live coverage of the multi-GPU device-mismatch fix would require multi-GPU
+    hardware, which we don't have locally — but running the RoPE branch at all
+    confirms the .to(q.device) hop is a no-op on single-device and that the
+    full Llama / partial GPT-J rotations don't crash.
+    """
+
+    def test_llama_full_rope_runs(self):
+        m = _load_tiny(_TINY_LLAMA)
+        data = forward_pass(m, "Hello world")
+        assert data.meta.arch.kind == ArchKind.LLAMA
+        assert data.meta.arch.positional_kind == "rope"
+        assert len(data.layers) == m.num_layers
+        # Probs row should still sum to ~1 even with the device hop in place.
+        S = len(data.input_tokens)
+        last_row = data.layers[0].attention.probs[0][S - 1]
+        assert math.isclose(sum(last_row), 1.0, abs_tol=0.01)
+
+    def test_gptj_partial_rope_runs(self):
+        m = _load_tiny(_TINY_GPTJ)
+        data = forward_pass(m, "Hello world")
+        assert data.meta.arch.kind == ArchKind.GPTJ
+        assert data.meta.arch.positional_kind == "rope"
+        # GPT-J has no GQA — KV heads == Q heads.
+        assert data.meta.arch.n_heads == data.meta.arch.n_kv_heads
+        # Partial RoPE: q tensor shape unchanged (only first rotary_dim rotated).
+        Dh = data.meta.arch.d_head
+        assert len(data.layers[0].per_position.q[0][0]) == Dh
+        # Probs row should still sum to ~1.
+        S = len(data.input_tokens)
+        last_row = data.layers[0].attention.probs[0][S - 1]
+        assert math.isclose(sum(last_row), 1.0, abs_tol=0.01)
+
+    def test_gptj_json_round_trip(self):
+        m = _load_tiny(_TINY_GPTJ)
+        data = forward_pass(m, "Hello world")
+        blob = data.model_dump_json()
+        rehydrated = ForwardPassData.model_validate_json(blob)
+        assert rehydrated.meta.arch.kind == ArchKind.GPTJ
