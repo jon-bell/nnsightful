@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 
 from ..types import (
-    ArchKind,
     ForwardPassArch,
     ForwardPassData,
     ForwardPassMeta,
@@ -20,15 +19,23 @@ if TYPE_CHECKING:
 _SUPPORTED_LLAMA_TYPES = {"llama", "mistral", "qwen2"}
 
 
-def _detect_arch(model: "StandardizedTransformer") -> ForwardPassArch:
+def _detect_arch(model: "StandardizedTransformer") -> dict[str, Any]:
+    """Return a plain dict describing the model architecture.
+
+    Returns a dict (not a Pydantic model) so the result can flow through
+    nnsight's trace + NDIF serializer without dragging in pydantic_core,
+    which NDIF's remote worker rejects ("Module pydantic_core._pydantic_core
+    is not whitelisted"). to_data_obj reconstructs the typed
+    ForwardPassArch on the way out, where pydantic is fine.
+    """
     cfg = model._model.config
     model_type = (getattr(cfg, "model_type", "") or "").lower()
     if model_type == "gpt2":
-        kind = ArchKind.GPT2
+        kind = "gpt2"
         has_fused_qkv = True
         positional_kind: Literal["absolute", "rope"] = "absolute"
     elif model_type in _SUPPORTED_LLAMA_TYPES:
-        kind = ArchKind.LLAMA
+        kind = "llama"
         has_fused_qkv = False
         positional_kind = "rope"
     else:
@@ -43,18 +50,18 @@ def _detect_arch(model: "StandardizedTransformer") -> ForwardPassArch:
     vocab_size = int(getattr(cfg, "vocab_size", 0))
     tie_word_embeddings = bool(getattr(cfg, "tie_word_embeddings", False))
 
-    return ForwardPassArch(
-        kind=kind,
-        n_layers=model.num_layers,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        d_model=d_model,
-        d_head=d_head,
-        vocab_size=vocab_size,
-        positional_kind=positional_kind,
-        has_fused_qkv=has_fused_qkv,
-        tie_word_embeddings=tie_word_embeddings,
-    )
+    return {
+        "kind": kind,
+        "n_layers": int(model.num_layers),
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "d_model": d_model,
+        "d_head": d_head,
+        "vocab_size": vocab_size,
+        "positional_kind": positional_kind,
+        "has_fused_qkv": has_fused_qkv,
+        "tie_word_embeddings": tie_word_embeddings,
+    }
 
 
 def _resolve_positions(positions: Any, seq_len: int) -> list[int]:
@@ -103,18 +110,20 @@ class ForwardPassTool(Tool):
         raw: bool = False,
         **kwargs,
     ) -> dict[str, Any] | str:
-        arch = _detect_arch(model)
-        # Serialize arch into a plain dict OUTSIDE the trace context. Doing
-        # this inside `_format` would record a pydantic_core call into the
-        # nnsight compute graph, which NDIF's remote worker rejects
-        # ("Module pydantic_core._pydantic_core is not whitelisted").
-        arch_dict = arch.model_dump(mode="json")
+        # _detect_arch returns a plain dict (not a Pydantic model) so the
+        # trace context never closes over any pydantic objects. NDIF
+        # serializes the trace frame via dill — anything referencing
+        # pydantic_core triggers their module allowlist.
+        arch_dict = _detect_arch(model)
         cfg = model._model.config
-        L = arch.n_layers
-        H = arch.n_heads
-        Hk = arch.n_kv_heads
-        D = arch.d_model
-        Dh = arch.d_head
+        L: int = arch_dict["n_layers"]
+        H: int = arch_dict["n_heads"]
+        Hk: int = arch_dict["n_kv_heads"]
+        D: int = arch_dict["d_model"]
+        Dh: int = arch_dict["d_head"]
+        is_gpt2: bool = arch_dict["kind"] == "gpt2"
+        is_rope: bool = arch_dict["positional_kind"] == "rope"
+        is_absolute: bool = arch_dict["positional_kind"] == "absolute"
 
         token_ids = model.tokenizer.encode(prompt)
         S = len(token_ids)
@@ -124,7 +133,7 @@ class ForwardPassTool(Tool):
 
         input_tokens = [model.tokenizer.decode([t]) for t in token_ids]
 
-        rope_theta = _get_rope_theta(cfg) if arch.positional_kind == "rope" else None
+        rope_theta = _get_rope_theta(cfg) if is_rope else None
 
         def _round4_list(t: torch.Tensor):
             return torch.round(t, decimals=4).tolist()
@@ -203,7 +212,7 @@ class ForwardPassTool(Tool):
                 tok_e_full = model.embed_tokens.output[0]  # [S, d]
                 tok_e_sel = tok_e_full[sel]
 
-                if arch.positional_kind == "absolute":
+                if is_absolute:
                     # GPT-2: read wpe weight matrix directly (lookup table)
                     wpe_w = model._model.transformer.wpe.weight  # [n_positions, d]
                     pos_e_full = wpe_w[:S]
@@ -215,7 +224,7 @@ class ForwardPassTool(Tool):
                 input_e_sel = input_e_full[sel]
 
                 # Precompute cos/sin for RoPE inside trace
-                if arch.positional_kind == "rope":
+                if is_rope:
                     inv_freq = 1.0 / (
                         rope_theta
                         ** (
@@ -233,7 +242,7 @@ class ForwardPassTool(Tool):
                 for i in range(L):
                     resid_pre = model.layers_input[i][0]  # [S, d]
 
-                    if arch.kind == ArchKind.GPT2:
+                    if is_gpt2:
                         ln1_out = model.layers[i].ln_1.output[0]
                         qkv = model.layers[i].self_attn.c_attn.output[0]  # [S, 3*d]
                         q = qkv[:, :D].view(S, H, Dh)
@@ -250,7 +259,7 @@ class ForwardPassTool(Tool):
                         attn_out = sa.o_proj.output[0]
                         ln2_out = model.layers[i].post_attention_layernorm.output[0]
 
-                    if arch.positional_kind == "rope":
+                    if is_rope:
                         cos_b = cos.unsqueeze(1)  # [S, 1, Dh]
                         sin_b = sin.unsqueeze(1)
 
