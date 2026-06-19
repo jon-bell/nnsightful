@@ -104,6 +104,11 @@ class ForwardPassTool(Tool):
         **kwargs,
     ) -> dict[str, Any] | str:
         arch = _detect_arch(model)
+        # Serialize arch into a plain dict OUTSIDE the trace context. Doing
+        # this inside `_format` would record a pydantic_core call into the
+        # nnsight compute graph, which NDIF's remote worker rejects
+        # ("Module pydantic_core._pydantic_core is not whitelisted").
+        arch_dict = arch.model_dump(mode="json")
         cfg = model._model.config
         L = arch.n_layers
         H = arch.n_heads
@@ -175,7 +180,7 @@ class ForwardPassTool(Tool):
                 "meta": {
                     "version": 1,
                     "model": model.repo_id,
-                    "arch": arch.model_dump(mode="json"),
+                    "arch": arch_dict,
                 },
                 "input_token_ids": list(token_ids),
                 "input_tokens": input_tokens,
