@@ -158,8 +158,6 @@ class ForwardPassTool(Tool):
                     {
                         "attention": {
                             "scores": _round4_list(attn["scores"]),
-                            "scores_masked": _round4_list(attn["scores_masked"]),
-                            "probs": _round4_list(attn["probs"]),
                         },
                         "per_position": {
                             "resid_pre": _round4_list(per_pos["resid_pre"]),
@@ -345,14 +343,13 @@ class ForwardPassTool(Tool):
                     k_t = k_for_scores.transpose(0, 1)  # [H, S, Dh]
                     scores = torch.matmul(q_t, k_t.transpose(-1, -2)) / math.sqrt(Dh)
 
-                    mask = torch.triu(
-                        torch.ones(S, S, device=scores.device, dtype=torch.bool),
-                        diagonal=1,
-                    )
-                    scores_masked_neg_inf = scores.masked_fill(mask, float("-inf"))
-                    probs_attn = torch.softmax(scores_masked_neg_inf, dim=-1)
-                    # For JSON: replace -inf with 0.0; UI applies causal mask from shape.
-                    scores_masked_json = scores.masked_fill(mask, 0.0)
+                    # NOTE: scores_masked and probs are no longer included in
+                    # the payload — the client derives them from `scores` (apply
+                    # causal mask, then softmax per row) to keep the wire-size
+                    # cubic-in-S blow-up to a single attention tensor instead of
+                    # three. At S=128 this drops the response from ~600 MB to
+                    # ~200 MB and lets the frontend stay under V8's max string
+                    # size without Buffer-extraction hacks.
 
                     resid_mid = resid_pre + attn_out
                     mlp_out = model.mlps_output[i][0]
@@ -362,8 +359,6 @@ class ForwardPassTool(Tool):
                         {
                             "attention": {
                                 "scores": scores.float().cpu(),
-                                "scores_masked": scores_masked_json.float().cpu(),
-                                "probs": probs_attn.float().cpu(),
                             },
                             "per_position": {
                                 "resid_pre": resid_pre[sel].float().cpu(),

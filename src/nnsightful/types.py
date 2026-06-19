@@ -88,9 +88,11 @@ class TopKLogits(BaseModel):
 
 
 class AttentionPayload(BaseModel):
+    # Shape: [n_heads][S][S]. Raw Q·Kᵀ / sqrt(d_head) post-RoPE, pre-mask.
+    # The causal-masked variant and post-softmax probs are derived by the client
+    # from `scores` — see frontend deriveAttention.ts. Halves the wire payload
+    # because each was the same O(L·H·S²) size as `scores`.
     scores: list[list[list[float]]]
-    scores_masked: list[list[list[float]]]
-    probs: list[list[list[float]]]
 
 
 class LayerPositionPayload(BaseModel):

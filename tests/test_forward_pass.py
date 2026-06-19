@@ -14,6 +14,21 @@ from nnsightful.types import ArchKind, ForwardPassData
 PROMPT = "The capital of France is"
 
 
+def _derive_probs_row(scores_h: list[list[float]], q: int) -> list[float]:
+    """Apply causal mask + numerically-stable softmax to row `q` of a single
+    head's score matrix. Mirrors what deriveAttention.ts does on the client.
+
+    scores_h: [S][S] — pre-mask, pre-softmax Q·Kᵀ / sqrt(d_head) for one head.
+    Returns one row of length S that sums to ≈ 1 (with positions k > q at 0).
+    """
+    row = scores_h[q]
+    masked = [(v if k <= q else float("-inf")) for k, v in enumerate(row)]
+    m = max(v for v in masked if v != float("-inf"))
+    exps = [(0.0 if v == float("-inf") else math.exp(v - m)) for v in masked]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+
 class TestForwardPassEndToEnd:
     """Integration tests that run forward_pass on a real model."""
 
@@ -66,20 +81,29 @@ class TestForwardPassEndToEnd:
         S = len(data.input_tokens)
         H = data.meta.arch.n_heads
         attn = data.layers[0].attention
+        # Only `scores` is emitted now — scores_masked + probs are derived
+        # client-side via deriveAttention.ts. See the AttentionPayload type.
         assert len(attn.scores) == H
         assert len(attn.scores[0]) == S
         assert len(attn.scores[0][0]) == S
-        assert len(attn.scores_masked) == H
-        assert len(attn.probs) == H
 
-    def test_attention_probs_sum_to_one(self, model):
-        """Each row of probs must sum to ~1 (post-softmax) for unmasked positions."""
+    def test_attention_scores_finite(self, model):
+        """Scores must be finite (no NaN/Inf) — pre-softmax raw Q·Kᵀ/sqrt(d_head)."""
+        data = forward_pass(model, PROMPT)
+        attn = data.layers[0].attention
+        for row in attn.scores[0]:
+            for v in row:
+                assert math.isfinite(v), f"non-finite score in layer 0 head 0: {v}"
+
+    def test_derived_probs_row_sums_to_one(self, model):
+        """Deriving softmax(causal_mask(scores)) — the same math the client runs
+        in deriveAttention.ts — must produce a row that sums to ≈ 1."""
         data = forward_pass(model, PROMPT)
         S = len(data.input_tokens)
         attn = data.layers[0].attention
-        # query position = last → all keys unmasked
-        last_row = attn.probs[0][S - 1]
-        assert math.isclose(sum(last_row), 1.0, abs_tol=0.01)
+        # query position = last → all S keys unmasked.
+        row = _derive_probs_row(attn.scores[0], q=S - 1)
+        assert math.isclose(sum(row), 1.0, abs_tol=0.01)
 
     def test_per_position_shapes(self, model):
         data = forward_pass(model, PROMPT)
@@ -174,10 +198,10 @@ class TestForwardPassRoPE:
         assert data.meta.arch.kind == ArchKind.LLAMA
         assert data.meta.arch.positional_kind == "rope"
         assert len(data.layers) == m.num_layers
-        # Probs row should still sum to ~1 even with the device hop in place.
+        # Derived softmax row should still sum to ~1 even with the device hop.
         S = len(data.input_tokens)
-        last_row = data.layers[0].attention.probs[0][S - 1]
-        assert math.isclose(sum(last_row), 1.0, abs_tol=0.01)
+        row = _derive_probs_row(data.layers[0].attention.scores[0], q=S - 1)
+        assert math.isclose(sum(row), 1.0, abs_tol=0.01)
 
     def test_gptj_partial_rope_runs(self):
         m = _load_tiny(_TINY_GPTJ)
@@ -189,10 +213,10 @@ class TestForwardPassRoPE:
         # Partial RoPE: q tensor shape unchanged (only first rotary_dim rotated).
         Dh = data.meta.arch.d_head
         assert len(data.layers[0].per_position.q[0][0]) == Dh
-        # Probs row should still sum to ~1.
+        # Derived softmax row should still sum to ~1.
         S = len(data.input_tokens)
-        last_row = data.layers[0].attention.probs[0][S - 1]
-        assert math.isclose(sum(last_row), 1.0, abs_tol=0.01)
+        row = _derive_probs_row(data.layers[0].attention.scores[0], q=S - 1)
+        assert math.isclose(sum(row), 1.0, abs_tol=0.01)
 
     def test_gptj_json_round_trip(self):
         m = _load_tiny(_TINY_GPTJ)
